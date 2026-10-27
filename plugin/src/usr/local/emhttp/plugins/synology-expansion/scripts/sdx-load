@@ -1,0 +1,197 @@
+#!/bin/bash
+# sdx-load [load|unload|status|leds] - loader for the synology_dx kernel module (DX1215 fans/state).
+# Written: 2026-10-25. Part of the synology-expansion Unraid plugin.
+#
+# load (default; run detached by the plugin's post-install at every boot and install):
+#   1. kmod/<uname -r>/synology_dx.ko must exist and match its sha256 file -> else "no build"
+#   2. modinfo vermagic must start with "<uname -r> " -> else refuse
+#   3. already loaded with the same srcversion -> nothing to do; another srcversion -> rmmod first
+#   4. DX hosts = ahci scsi hosts whose ata port has PMP fan-out links (/sys/class/ata_link/linkN.M)
+#      (the module itself checks 1b4b:9705 and refuses anything else)
+#   5. ata_exec_internal from /proc/kallsyms: exactly one non-zero address (the module checks it
+#      again with sprint_symbol and refuses a wrong one)
+#   6. insmod <ko> hosts=... exec_internal=0x...
+# Every refusal/failure: syslog (tag synology-expansion) + Unraid notification; exit status is always 0
+# for load, so nothing here can fail the plugin or block the boot.
+#   7. (2026.10.26a) bay LEDs per the settings, default ON: leds_enabled=1 on every DS2415+ 88SE9215 (the driver
+#      then also drives PCH GPIO 49, the orange enable) and unit/dx_leds_enabled=1 on the DX1215; recorded as the
+#      check lines ds_leds, pch and dx_leds. Orange (fault) is NOT set here: the Synology Hardware plugin's daemon
+#      owns that policy (disk health -> fault_mask / hostN/fault), as it owns the fan policy.
+# unload: rmmod synology_dx (the module writes back the fan level it read at load).
+# leds: apply DS_LEDS / DX_LEDS to the running driver (the page's Apply runs this), rewrite those check lines.
+# status: one line, also kept in $RUN/status for the plugin page.
+# Each load also writes $RUN/checks (what was verified, for the plugin page), one line per step:
+#   <key>\t<ok|fail|skip>\t<measured value or reason>     and a last line   result\t<code>\t<text>
+# codes: loaded, already_loaded, no_build, refused, no_dx, insmod_failed
+#
+# Test hooks (tests/run-tests.sh): SDX_SYS, SDX_PROC, SDX_KV, SDX_KMOD, SDX_RUN and the commands
+# SDX_INSMOD, SDX_RMMOD, SDX_MODINFO, SDX_LOGGER, SDX_NOTIFY, SDX_CFG.
+set -u
+SYS=${SDX_SYS:-/sys}
+PROC=${SDX_PROC:-/proc}
+KV=${SDX_KV:-$(uname -r)}
+KMOD=${SDX_KMOD:-/usr/local/emhttp/plugins/synology-expansion/kmod}
+RUN=${SDX_RUN:-/var/run/synology-expansion}
+INSMOD=${SDX_INSMOD:-/sbin/insmod}
+RMMOD=${SDX_RMMOD:-/sbin/rmmod}
+MODINFO=${SDX_MODINFO:-/sbin/modinfo}
+LOGGER=${SDX_LOGGER:-logger}
+NOTIFY=${SDX_NOTIFY:-/usr/local/emhttp/webGui/scripts/notify}
+OLDPLUG=${SDX_OLD:-/usr/local/emhttp/plugins/synology-dx}   # the plugin's previous ID (2026.10.25a)
+# settings (2026.10.26a): DS_LEDS="0" keeps the DS2415+ internal bay LEDs off, DX_LEDS="0" the DX1215 bay LEDs;
+# anything else (or no file) = on. The driver is always loaded with ds_leds=1: that attaches to the three 88SE9215
+# and the PCH read-only; only leds_enabled=1 writes (2026.10.25d loaded it only with DS_LEDS="1").
+CFG=${SDX_CFG:-/boot/config/plugins/synology-expansion/synology-expansion.cfg}
+KO=$KMOD/$KV/synology_dx.ko
+
+mkdir -p "$RUN" 2>/dev/null
+CHK=$RUN/checks.new
+log()    { "$LOGGER" -t synology-expansion -- "$*"; }
+check()  { printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$CHK" 2>/dev/null; }
+result() { check result "$1" "$2"; mv -f "$CHK" "$RUN/checks" 2>/dev/null; }
+status() { echo "$(date '+%F %T') $*" > "$RUN/status" 2>/dev/null; }
+# warn: syslog + Unraid notification (if the notify script exists) + status line
+warn() {  # message [subject]
+  log "$1"; status "$1"
+  [ -x "$NOTIFY" ] && "$NOTIFY" -e "synology-expansion" -s "${2:-Synology expansion unit driver not loaded}" -d "$1" -i "warning" >/dev/null 2>&1
+  return 0
+}
+
+cfg_on() { ! grep -qE "^$1=\"?0\"?\$" "$CFG" 2>/dev/null; }   # cfg_on KEY: rc 0 unless KEY="0"
+
+# bay LEDs per the settings; appends the check lines ds_leds, pch, dx_leds
+apply_leds() {
+  local ds=$SYS/kernel/synology_dx/ds f d v want n=0 bad=0 pch st base
+  if cfg_on DS_LEDS; then want=1; else want=0; fi
+  for d in "$ds"/0000:*; do
+    [ -f "$d/leds_enabled" ] || continue
+    n=$((n + 1))
+    v=$(cat "$d/leds_enabled" 2>/dev/null)
+    [ "$v" = "$want" ] && continue
+    echo "$want" > "$d/leds_enabled" 2>/dev/null || { bad=$((bad + 1)); continue; }
+    [ "$(cat "$d/leds_enabled" 2>/dev/null)" = "$want" ] || bad=$((bad + 1))
+  done
+  if [ $n = 0 ]; then check ds_leds fail "no 88SE9215 under $ds (driver without ds_leds=1?)"
+  elif [ $bad != 0 ]; then check ds_leds fail "leds_enabled=$want failed on $bad of $n controllers (see dmesg)"
+  elif [ $want = 1 ]; then check ds_leds ok "on: leds_enabled=1 on $n controllers (88SE9215)"
+  else check ds_leds ok "off (DS_LEDS=\"0\"): leds_enabled=0 on $n controllers"; fi
+  pch=$(cat "$ds/pch_led_enable" 2>/dev/null); st=$(sed -n 's/^state //p' "$ds/pch" 2>/dev/null)
+  base=$(sed -n 's/^gpiobase //p' "$ds/pch" 2>/dev/null)
+  if [ $n = 0 ]; then :
+  elif [ $want = 1 ] && [ "$pch" = 1 ]; then check pch ok "GPIO 49 high (orange enable), GPIOBASE ${base:-?}"
+  elif [ $want = 1 ]; then check pch fail "pch_led_enable=${pch:-?}: ${st:-no ds/pch file}; orange cannot light"
+  else check pch skip "GPIO 49 as found at load (DS bay LEDs off): pch_led_enable=${pch:-?}"; fi
+  f=$SYS/kernel/synology_dx/unit/dx_leds_enabled
+  if cfg_on DX_LEDS; then want=1; else want=0; fi
+  if [ ! -f "$f" ]; then check dx_leds skip "no DX1215 unit directory"; return 0; fi
+  v=$(cat "$f" 2>/dev/null)
+  [ "$v" = "$want" ] || echo "$want" > "$f" 2>/dev/null
+  v=$(cat "$f" 2>/dev/null)
+  if [ "$v" = "$want" ]; then check dx_leds ok "$([ $want = 1 ] && echo "on" || echo "off (DX_LEDS=\"0\")"): dx_leds_enabled=$v"
+  else check dx_leds fail "dx_leds_enabled reads '$v', wanted $want (see dmesg)"; fi
+  return 0
+}
+
+do_leds() {   # the page's Apply: settings -> running driver, check lines rewritten in place
+  local res
+  if [ ! -d "$SYS/module/synology_dx" ]; then log "leds: driver not loaded, settings apply at the next load"; return 0; fi
+  rm -f "$CHK"
+  [ -f "$RUN/checks" ] && grep -vE $'^(ds_leds|pch|dx_leds|result)\t' "$RUN/checks" > "$CHK"
+  apply_leds
+  res=$(grep -E $'^result\t' "$RUN/checks" 2>/dev/null | tail -1)
+  [ -n "$res" ] && printf '%s\n' "$res" >> "$CHK"
+  mv -f "$CHK" "$RUN/checks" 2>/dev/null
+  log "bay LEDs applied: $(grep -E $'^(ds_leds|pch|dx_leds)\t' "$RUN/checks" | tr '\t\n' ' ;')"
+  return 0
+}
+
+dx_hosts() {  # prints "18,19,20,21"
+  local h n pn a out=""
+  for h in "$SYS"/class/scsi_host/host*; do
+    [ -e "$h/proc_name" ] || continue
+    pn=$(cat "$h/proc_name" 2>/dev/null)
+    [ "$pn" = ahci ] || continue
+    n=${h##*/host}
+    a=$(readlink -f "$h" | grep -oE '/ata[0-9]+/' | tr -d /)
+    [ -n "$a" ] || continue
+    ls -d "$SYS/class/ata_link/link${a#ata}."* >/dev/null 2>&1 || continue
+    out="$out${out:+,}$n"
+  done
+  echo "$out"
+}
+
+do_load() {
+  local vm want addr n hosts src_have src_want out rc ver msg
+  rm -f "$CHK"
+  check started ok "$(date '+%F %T')"
+  if [ -d "$OLDPLUG" ]; then   # both plugins would load/unload the same module: warn, carry on
+    check oldplugin fail "the old synology-dx plugin is still installed: remove it (plugin remove synology-dx.plg) BEFORE relying on this one; removing it later unloads the driver"
+    warn "the old synology-dx plugin is still installed; remove it: plugin remove synology-dx.plg (its removal unloads the driver, reinstall or reboot afterwards)" "Old synology-dx plugin still installed"
+  fi
+  if [ ! -f "$KO" ]; then
+    msg="no synology_dx build for kernel $KV in $KMOD (plugin needs an update for this Unraid version); DX fans stay at their current level"
+    check build fail "no build for $KV (builds: $(ls "$KMOD" 2>/dev/null | tr '\n' ' '))"; result no_build "$msg"; warn "$msg"; return 0; fi
+  ver=$("$MODINFO" -F version "$KO" 2>/dev/null)
+  check build ok "kmod/$KV/synology_dx.ko (version ${ver:-?})"
+  if [ ! -f "$KO.sha256" ] || ! (cd "$KMOD/$KV" && sha256sum -c --status synology_dx.ko.sha256); then
+    msg="synology_dx.ko for $KV does not match its sha256: not loading"
+    check sha256 fail "does not match synology_dx.ko.sha256"; result refused "$msg"; warn "$msg"; return 0; fi
+  check sha256 ok "$(cut -c1-16 "$KO.sha256")..."
+  vm=$("$MODINFO" -F vermagic "$KO" 2>/dev/null)
+  case "$vm" in "$KV "*) ;; *)
+    msg="synology_dx.ko vermagic '$vm' does not match running kernel $KV: not loading"
+    check vermagic fail "'$vm' vs running $KV"; result refused "$msg"; warn "$msg"; return 0;; esac
+  check vermagic ok "$vm"
+  src_want=$("$MODINFO" -F srcversion "$KO" 2>/dev/null)
+  if [ -d "$SYS/module/synology_dx" ]; then
+    src_have=$(cat "$SYS/module/synology_dx/srcversion" 2>/dev/null)
+    if [ -n "$src_want" ] && [ "$src_have" = "$src_want" ]; then
+      check insmod ok "already loaded ($src_have)"; apply_leds; result already_loaded "synology_dx $ver already loaded"
+      log "synology_dx already loaded ($src_have)"; status "loaded ($src_have)"; return 0; fi
+    log "replacing loaded synology_dx $src_have with $src_want"
+    out=$("$RMMOD" synology_dx 2>&1) || {
+      msg="rmmod of the old synology_dx failed: $out"; check replace fail "$out"; result refused "$msg"; warn "$msg"; return 0; }
+    check replace ok "unloaded older build $src_have"
+  fi
+  hosts=$(dx_hosts)
+  if [ -z "$hosts" ]; then
+    check hosts fail "no ahci port with a port multiplier"; result no_dx "no expansion unit attached"
+    log "no ahci host with a port multiplier: no DX1215 attached, not loading"; status "no DX1215 found"; return 0; fi
+  check hosts ok "$hosts"
+  n=$(awk '$3=="ata_exec_internal"{print $1}' "$PROC/kallsyms" 2>/dev/null | sort -u)
+  if [ "$(printf '%s\n' "$n" | grep -c .)" != 1 ] || ! printf '%s' "$n" | grep -qE '^[0-9a-f]{16}$' || [ "$n" = 0000000000000000 ]; then
+    msg="ata_exec_internal address not readable from $PROC/kallsyms ('$n'): not loading"
+    check kallsyms fail "'$n'"; result refused "$msg"; warn "$msg"; return 0; fi
+  addr=0x$n
+  check kallsyms ok "$addr"
+  out=$("$INSMOD" "$KO" "hosts=$hosts" "exec_internal=$addr" ds_leds=1 2>&1); rc=$?
+  if [ $rc != 0 ]; then
+    msg="insmod synology_dx hosts=$hosts failed ($rc): $out (see dmesg)"
+    check insmod fail "$out"; result insmod_failed "$msg"; warn "$msg"; return 0; fi
+  want=$(sed -n 's/^master //p' "$SYS/kernel/synology_dx/unit/summary" 2>/dev/null)
+  check insmod ok "loaded, master ${want:-none}"
+  apply_leds
+  result loaded "synology_dx $ver loaded on hosts $hosts, master ${want:-none}"
+  log "loaded synology_dx $src_want for $KV on hosts $hosts, master ${want:-none}"
+  status "loaded ($src_want) hosts $hosts master ${want:-none}"
+  return 0
+}
+
+do_unload() {
+  local out
+  if [ -d "$SYS/module/synology_dx" ]; then
+    out=$("$RMMOD" synology_dx 2>&1) && { log "unloaded synology_dx"; status "unloaded"; return 0; }
+    log "rmmod synology_dx failed: $out"; status "rmmod failed: $out"; return 1
+  fi
+  status "not loaded"; return 0
+}
+
+case "${1:-load}" in
+  load)   do_load; exit 0 ;;
+  unload) do_unload ;;
+  leds)   do_leds; exit 0 ;;
+  status) if [ -d "$SYS/module/synology_dx" ]; then echo "loaded: $(sed -n 's/^master //p;s/^fan_level //p;s/^fan_fail //p' "$SYS/kernel/synology_dx/unit/summary" 2>/dev/null | tr '\n' ' ')";
+          else echo "not loaded"; fi
+          [ -f "$RUN/status" ] && echo "last loader result: $(cat "$RUN/status")"; exit 0 ;;
+  *) echo "usage: $0 [load|unload|status|leds]"; exit 2 ;;
+esac

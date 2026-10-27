@@ -1,0 +1,10 @@
+/* synology-expansion page sheet (loaded by Unraid's PageBuilder.php includePageStylesheets). Layout only:
+   every colour comes from the dynamix theme classes (green-text, orange-text, red-text, grey-text, *-orb). 2026.10.25b */
+.sdx-verdict { font-size: 1.4rem; margin: 1rem 0 .4rem 0; }
+table.unraid.sdx-table { width: 100%; max-width: 100%; }
+table.unraid.sdx-table td { white-space: normal !important; line-height: 1.5; padding-top: .4rem; padding-bottom: .4rem; vertical-align: top; }
+table.unraid.sdx-table td:first-child { width: 2rem; }
+table.unraid.sdx-findings td:first-child { width: 12rem; }
+details.sdx-raw { margin: 1rem 0; }
+details.sdx-raw > summary { cursor: pointer; min-height: 24px; line-height: 24px; }
+table.unraid.sdx-bays td:first-child { width: 7rem; }

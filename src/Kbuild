@@ -1,0 +1,3 @@
+obj-m := synology_dx.o
+# drivers/ata/libata.h (ata_exec_internal prototype) and ahci.h of the exact source tree
+ccflags-y := -I$(srctree)/drivers/ata

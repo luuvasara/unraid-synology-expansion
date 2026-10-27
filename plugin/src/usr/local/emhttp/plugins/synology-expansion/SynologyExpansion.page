@@ -1,0 +1,64 @@
+Menu="Utilities"
+Title="Synology Expansion Unit Driver"
+Icon="synology-expansion.png"
+Tag="server"
+---
+<?php
+/* synology-expansion status page: did the driver load, what did it check, what does the unit report.
+ * Written: 2026-10-25 (2026.10.25b); 2026.10.26a: bay LED table + LED settings form (update.php -> sdx-load leds). Status part read-only; the logic is in include/sdx-status.php (tests: tests/status_test.php).
+ * Help block: the webGui's ":name_plug:" ... ":end" markup, shown by the Help button (as on the synology-hw page). */
+require_once "$docroot/plugins/synology-expansion/include/sdx-status.php";
+$sdx = sdx_collect(sdx_paths());
+$cfg = $sdx['cfg']; $plugin = 'synology-expansion';
+?>
+<?=sdx_render($sdx)?>
+
+<div class="title"><span class="left"><i class="title fa fa-sliders"></i>Bay LED settings</span><span class="grey-text">Click a label, or the Help button, for what it does.</span></div>
+
+<form markdown="1" name="sdx_leds" method="POST" action="/update.php" target="progressFrame">
+<input type="hidden" name="#file" value="<?=$plugin?>/<?=$plugin?>.cfg">
+<input type="hidden" name="#command" value="/plugins/<?=$plugin?>/scripts/sdx-load">
+<input type="hidden" name="#arg[1]" value="leds">
+
+DS2415+ bay LEDs (DS_LEDS):
+: <select name="DS_LEDS" aria-label="DS2415+ bay LEDs (DS_LEDS)">
+  <?=mk_option($cfg['DS_LEDS'], "1", "On (default)")?>
+  <?=mk_option($cfg['DS_LEDS'], "0", "Off")?>
+  </select>
+
+:sdx_ds_leds_plug:
+> **On** (default): at every load the driver gets `leds_enabled=1` on each of the three 88SE9215 controllers (DSM's own three init values, `research/2026-10-25-bay-leds.md`): green then shows presence and activity. The first one also sets Avoton PCH GPIO 49 high, which DSM's synobios does before its first disk LED and which the orange LEDs need (`research/2026-10-26-ds-orange-led.md`). **Off**: `leds_enabled=0`, the controllers get back the values found at load and GPIO 49 its value at load; the bays stay dark and no orange can show.
+:end
+
+DX1215 bay LEDs (DX_LEDS):
+: <select name="DX_LEDS" aria-label="DX1215 bay LEDs (DX_LEDS)">
+  <?=mk_option($cfg['DX_LEDS'], "1", "On (default)")?>
+  <?=mk_option($cfg['DX_LEDS'], "0", "Off")?>
+  </select>
+
+:sdx_dx_leds_plug:
+> **On** (default): `unit/dx_leds_enabled=1` clears the disk-LED mask (page 1 bit 6) on all four port multipliers; each write is one short libata error-handler round with readback. **Off**: sets the mask again (the power-on state measured on this unit). Orange on the DX1215 is a separate bit per bay (`hostN/fault`), shown only while the mask is clear.
+:end
+
+&nbsp;
+: <span class="inline-block">
+    <input type="submit" value="Apply" disabled>
+    <input type="button" value="Done" onclick="done()">
+  </span>
+
+:sdx_leds_apply_plug:
+> Apply saves the form into `/boot/config/plugins/synology-expansion/synology-expansion.cfg` (Unraid's `/update.php`) and runs `scripts/sdx-load leds`, which writes the two settings to the running driver and updates the LED lines of the checks above; nothing is reloaded. At the next boot the loader applies them again. Orange (fault) is not set here: the Synology Hardware plugin decides it from disk health.
+:end
+</form>
+
+:sdx_status_plug:
+> **What this plugin is.** A kernel driver (module `synology_dx`) for Synology expansion units built on the Marvell 88SM9705 port multiplier: tested on the DX1215 (RX1214 and RX413 use the same chip, untested). It talks to the unit's control chip over the SATA cable and gives the Synology Hardware plugin the fan level, both fan alarms, power and PSU status and the unit model. It changes nothing by itself: the fan level is set by the Synology Hardware plugin (or by hand in `/sys/kernel/synology_dx/unit/fan_level`: full, middle, low).
+>
+> **The checks.** At every boot and plugin install the loader checks that the plugin has a driver build for the running Unraid kernel, that the file is intact (sha256) and made for this kernel (vermagic), finds the unit's port multipliers in sysfs, takes the address of the kernel function the driver needs (`ata_exec_internal`) from `/proc/kallsyms`, and loads the driver. The driver checks the address and each port again before it does anything, and refuses on any mismatch. It then reads the unit's status lines and puts every register it touched back as it found it. The loader's record: `/var/run/synology-expansion/checks`; syslog tag `synology-expansion`.
+>
+> **The findings** come from the unit master (the port multiplier with EMID 0). Bit meanings are from Synology's own code (`research/2026-10-25-dx1215-gpio-spec.md`) and were measured on this unit (`experiments/2026-10-25-synology-dx-phase2a/RESULT.md`, `-phase2b/RESULT.md`). Values not yet confirmed are shown raw and marked.
+>
+> **Bay LEDs** (2026.10.26a). On by default. Green = presence/activity, driven by the controllers themselves. Orange = fault: the Synology Hardware plugin's daemon (which already owns the fan policy and reads Unraid's disk state) sets it from disk health, about once a minute; this plugin only switches the LEDs on and shows what is set. The bay table's Health column is that daemon's verdict per disk.
+>
+> **Cost of this page.** Opening it may make the driver re-read the unit (at most every 30 s): one short pause of the unit's master SATA port.
+:end

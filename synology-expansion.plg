@@ -1,0 +1,94 @@
+<?xml version='1.0' standalone='yes'?>
+<!DOCTYPE PLUGIN [
+  <!ENTITY name    "synology-expansion">
+  <!ENTITY version "2026.10.26c">
+  <!ENTITY gitURL  "https://raw.githubusercontent.com/luuvasara/unraid-synology-expansion/main">
+  <!ENTITY pluginURL "&gitURL;/synology-expansion.plg">
+  <!ENTITY pkg     "synology-expansion-&version;-x86_64-1.txz">
+  <!ENTITY pkgURL  "&gitURL;/packages/&pkg;">
+  <!ENTITY md5     "af4449e5926f3c268757565577737789">
+]>
+<!-- Written: 2026-10-25. "Synology Expansion Unit Driver": kernel module synology_dx for Synology expansion
+     units on the 88SM9705 port multiplier (tested: DX1215), one build per Unraid kernel inside the package
+     (kmod/<uname -r>/). Plugin ID until 2026.10.25a: synology-dx; renamed to synology-expansion in 2026.10.25b
+     (versions continue). The module name synology_dx and its sysfs/hwmon paths are a stable API and did not
+     change. Install: Plugins, Install Plugin,
+     https://raw.githubusercontent.com/luuvasara/unraid-synology-expansion/main/synology-expansion.plg (or plugin install
+     <that URL>); the package is downloaded from packages/ in the same repository and MD5-checked.
+     Bump &version; on EVERY change. &md5; is filled in by build.sh; never edit it by hand. -->
+<PLUGIN name="&name;" author="synology-hardware project" version="&version;" min="7.0.0" launch="Utilities/SynologyExpansion" pluginURL="&pluginURL;">
+
+<CHANGES>
+###2026.10.26c
+- Published: install and update from GitHub (https://github.com/luuvasara/unraid-synology-expansion). The .plg has its pluginURL, so Unraid's update check sees new versions; the package is downloaded from the repository's packages/ folder and checked against its MD5 before it is installed. Driver unchanged (synology_dx 0.6.1).
+
+###2026.10.26b
+- Driver synology_dx 0.6.1: ds/pch shows lvl2_b2_written (the byte the driver wrote, its shadow) next to lvl2_b2_read. Measured on the DS2415+: after writing 0x3a (GPIO 49 high, orange lights) a read still gives 0x38, because the Avoton level register reads the pin input, not the output latch. 0.6.0 showed only the read value, as "lvl2_b2_now", which looked as if the write had not happened.
+
+###2026.10.26a
+- Bay LEDs ON by default at boot: the loader sets leds_enabled=1 on the three DS2415+ 88SE9215 controllers and dx_leds_enabled=1 on the DX1215 (green = presence/activity). New settings on the page, DS2415+ bay LEDs and DX1215 bay LEDs (DS_LEDS / DX_LEDS in synology-expansion.cfg, "0" = off); Apply writes them to the running driver (sdx-load leds), no reload. The driver is now always loaded with ds_leds=1 (read-only attach until leds_enabled is written).
+- Driver synology_dx 0.6.0: the DS2415+ orange LEDs work. As DSM's synobios does, the driver drives Avoton PCH GPIO 49 high (one byte at GPIOBASE+0x8a, bit 1 only, GPIOBASE from 00:1f.0 config 0x48, after checking the pin is a GPIO output and taking the I/O ports with request_region) while any 88SE9215 has its LEDs on, and puts the value found at load back when the last is switched off and at unload. State: /sys/kernel/synology_dx/ds/pch_led_enable and ds/pch.
+- Orange (fault) is driven from disk health by the Synology Hardware plugin's daemon (which owns the fan policy too); this plugin only switches the LEDs on and shows them.
+- Page: a Bay LEDs table (DS2415+ bays 1-12, DX1215 bays 1-12: disk, green, orange, the health verdict), and the checks list now shows the DS LED, PCH GPIO 49 and DX LED lines with their live values. Bay numbers confirmed at the box by blink count (DS bay = 4 x controller + port + 1, DX bay = 3 x EMID + port + 1).
+
+###2026.10.25d
+- Driver synology_dx 0.5.0: disk LEDs. DX1215: per port multiplier, page 1 of its GPIO (disk-LED mask bit 6, orange fault bits 0-2) as /sys/kernel/synology_dx/hostN/led_mask and fault, and unit/dx_leds_enabled for all four at once; written in one libata EH round with readback, bit 5 (buzzer) never set, bits 3, 4, 7 kept. Unload writes back the page 1 values found at load.
+- DS2415+ internal bays (88SE9215 GPIO, off unless DS_LEDS="1" in /boot/config/plugins/synology-expansion/synology-expansion.cfg): /sys/kernel/synology_dx/ds/&lt;pci&gt;/ with gpio_oe, gpio_out, gpio_func, saved, ports, leds_enabled and fault_mask; read only until written; unload writes back the values found at load. This belongs to the main unit and lives in this driver for now.
+- Nothing is lit by the driver on its own: the LEDs change only when one of the files above is written.
+
+###2026.10.25c
+- Author shown in the Plugins list: "synology-hardware project" (same wording as the Synology Hardware plugin).
+
+###2026.10.25b
+- New name and ID: "Synology Expansion Unit Driver", plugin ID synology-expansion (was synology-dx). Remove the old synology-dx plugin before installing (both would load and unload the same driver); if it is still present, the loader warns (syslog and notification) and loads the driver only once. The driver itself is unchanged (synology_dx 0.4.0), and so are its paths /sys/kernel/synology_dx/ and hwmon synology_dx, which the Synology Hardware plugin reads.
+- Plugins list: title and a one-sentence description (README.md in the plugin directory, the webGui's own mechanism).
+- The page (Utilities, Synology Expansion Unit Driver) now says in plain words whether the driver works: a coloured verdict (loaded and responding / no expansion unit / not loaded and why / fan alarm), the list of what was checked with the measured values (kernel build, checksum, vermagic, port multipliers found, kernel address, master port multiplier, unit identified, register reads and restore, fan level), the findings in words with where each meaning comes from, and the raw dump folded away. Help button explains it all.
+- The loader records each step it verified in /var/run/synology-expansion/checks for the page. Syslog tag and runtime dir follow the new ID.
+- Tests: page rendering for six states (loaded, no build, no unit, fan alarm, alarm during a stop test, driver missing, a failed register read) with four library mutants; loader tests extended (checks file, old plugin present).
+
+###2026.10.25a (as synology-dx)
+- First version. Kernel module synology_dx 0.4.0 for 6.18.58-Unraid (Unraid 7.3.4).
+- At every boot and install the loader (scripts/sdx-load, run detached so it never holds up the boot) checks that a build for the running kernel exists, matches its sha256 and its vermagic, finds the DX1215 hosts in sysfs (ahci ports with a port multiplier), takes ata_exec_internal from /proc/kallsyms and loads the module. No build, mismatch or failure: not loaded, syslog (tag synology-dx) and an Unraid notification.
+- The module: GPIO page reads of the four 88SM9705 PMPs inside libata EH, fan level writes on the EMID-0 master only (full/middle/low, readback, FULL on failure), time-limited STOP test, fan1/fan2 alarms. /sys/kernel/synology_dx/unit/ and hwmon "synology_dx" (fan1_alarm, fan2_alarm, pwm1 255/128/64, pwm1_enable).
+- Remove: rmmod (the module writes back the fan level it read at load), removepkg.
+- Status page Utilities, Synology DX1215: loader result and the unit summary. Fan policy stays in synology-hw.
+</CHANGES>
+
+<!-- pre-install: dirs, version-preserving cleanup of old packages on flash -->
+<FILE Run="/bin/bash">
+<INLINE>
+mkdir -p /boot/config/plugins/&name;
+ls /boot/config/plugins/&name;/&name;-*-x86_64-1.txz 2>/dev/null | grep -v '&version;' | xargs -r rm -f
+</INLINE>
+</FILE>
+
+<!-- payload: downloaded to the flash (MD5 checked after the download, and for the flash copy at every boot), then upgradepkg -->
+<FILE Name="/boot/config/plugins/&name;/&pkg;" Run="upgradepkg --install-new --reinstall">
+<URL>&pkgURL;</URL>
+<MD5>&md5;</MD5>
+</FILE>
+
+<!-- post-install: start the loader detached and never fail (a failing Run at boot moves the .plg to
+     plugins-error); insmod waits for a libata EH round, which must not hold up rc.local -->
+<FILE Run="/bin/bash">
+<INLINE>
+chmod 755 /usr/local/emhttp/plugins/&name;/scripts/sdx-load
+setsid /usr/local/emhttp/plugins/&name;/scripts/sdx-load load &lt;/dev/null &gt;/dev/null 2&gt;&amp;1 &amp;
+echo "synology-expansion: loader started in the background (syslog tag synology-expansion, status: /usr/local/emhttp/plugins/&name;/scripts/sdx-load status)"
+exit 0
+</INLINE>
+</FILE>
+
+<!-- remove: rmmod (fan level back to the level at load), package, runtime dir. The flash dir keeps nothing else. -->
+<FILE Run="/bin/bash" Method="remove">
+<INLINE>
+/usr/local/emhttp/plugins/&name;/scripts/sdx-load unload || logger -t &name; "rmmod failed at plugin remove; the module stays loaded until reboot"
+removepkg &name;-&version;-x86_64-1
+rm -rf /var/run/&name;
+rm -f /boot/config/plugins/&name;/&pkg;
+echo "synology-expansion removed."
+exit 0
+</INLINE>
+</FILE>
+
+</PLUGIN>
